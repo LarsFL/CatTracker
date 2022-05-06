@@ -1,27 +1,22 @@
 # limit the number of cpus used by high performance libraries
 import os
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "8"
+os.environ["OPENBLAS_NUM_THREADS"] = "8"
+os.environ["MKL_NUM_THREADS"] = "8"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "8"
+os.environ["NUMEXPR_NUM_THREADS"] = "8"
 
 import sys
 sys.path.insert(0, './yolov5')
 
 import argparse
 import os
-import platform
 import shutil
-import time
 from pathlib import Path
-import numpy as np
 import cv2
 import torch
 import torch.backends.cudnn as cudnn
 
-from yolov5.models.experimental import attempt_load
-from yolov5.utils.downloads import attempt_download
 from yolov5.models.common import DetectMultiBackend
 from yolov5.utils.datasets import LoadImages, LoadStreams, VID_FORMATS
 from yolov5.utils.general import (LOGGER, check_img_size, non_max_suppression, scale_coords,
@@ -49,6 +44,12 @@ def detect(opt):
     # Initialize
     device = select_device(opt.device)
     half &= device.type != 'cpu'  # half precision only supported on CUDA
+    currentCrop = [0, 500, 0, 500]
+    centerX, centerY = 250, 250
+    targetX, targetY = 250, 250
+    largestDim, targetDim = 50, 50
+    lastTargetId = 0
+    lostTargetCount = 0
 
     # The MOT16 evaluation runs multiple inference streams in parallel, each one writing to
     # its own .txt file. Hence, in that case, the output folder is not restored
@@ -167,6 +168,10 @@ def detect(opt):
 
             annotator = Annotator(im0, line_width=2, pil=not ascii)
 
+            imgTest = im0.copy()
+            maxWidth = imgTest.shape[1]
+            maxHeight = imgTest.shape[0]
+
             if det is not None and len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_coords(im.shape[2:], det[:, :4], im0.shape).round()
@@ -186,9 +191,26 @@ def detect(opt):
                 t5 = time_sync()
                 dt[3] += t5 - t4
 
+                firstCat = True
+                firstTargetX, firstTargetY = 0, 0
+                secondTargetX, secondTargetY = 0, 0
+                firstTargetDim, secondTargetDim = 0, 0
                 # draw boxes for visualization
                 if len(outputs[i]) > 0:
                     for j, (output) in enumerate(outputs[i]):
+                        if not firstCat and (names[int(output[5])] == "dog" or names[int(output[5])] == "cat" or names[int(output[5])] == "bear" or names[int(output[5])] == "teddy bear"):
+                            secondTargetX = (int(output[0]) + int(output[2])) / 2
+                            secondTargetY = (int(output[1]) + int(output[3])) / 2
+
+                            secondTargetDim = int(max([int(output[2]) - int(output[0]), int(output[3]) - int(output[1])]) * 1.5)
+                        
+                        if firstCat and (names[int(output[5])] == "dog" or names[int(output[5])] == "cat" or names[int(output[5])] == "bear" or names[int(output[5])] == "teddy bear"):
+                            firstTargetX = (int(output[0]) + int(output[2])) / 2
+                            firstTargetY = (int(output[1]) + int(output[3])) / 2
+
+                            firstTargetDim = int(max([int(output[2]) - int(output[0]), int(output[3]) - int(output[1])]) * 1.5)
+
+                            firstCat = False
 
                         bboxes = output[0:4]
                         id = output[4]
@@ -213,6 +235,28 @@ def detect(opt):
                             if save_crop:
                                 txt_file_name = txt_file_name if (isinstance(path, list) and len(path) > 1) else ''
                                 save_one_box(bboxes, imc, file=save_dir / 'crops' / txt_file_name / names[c] / f'{id}' / f'{p.stem}.jpg', BGR=True)
+                    
+                    if (secondTargetX == 0 and lostTargetCount == 0 and firstTargetX != 0):
+                        targetX = firstTargetX
+                        targetY = firstTargetY
+                        targetDim = firstTargetDim
+
+                    if (secondTargetX != 0):
+                        if (abs(secondTargetX - firstTargetX) < (.3 * maxWidth) and abs(secondTargetY - firstTargetY) < (.3 * maxHeight)):
+                            lostTargetCount = 100
+                            targetX = int((firstTargetX + secondTargetX) / 2)
+                            targetY = int((firstTargetY + secondTargetY) / 2)
+                            targetDim = int(max(firstTargetDim, secondTargetDim) * 1.85)
+                        else:
+                            targetX = firstTargetX
+                            targetY = firstTargetY
+                            targetDim = firstTargetDim
+                            lostTargetCount = lostTargetCount - 1 if lostTargetCount != 0 else 0
+                    
+                    if (secondTargetX == 0 and lostTargetCount > 0):
+                        lostTargetCount -= 1
+
+
 
                 LOGGER.info(f'{s}Done. YOLO:({t3 - t2:.3f}s), DeepSort:({t5 - t4:.3f}s)')
 
@@ -220,10 +264,40 @@ def detect(opt):
                 deepsort_list[i].increment_ages()
                 LOGGER.info('No detections')
 
+            # Apply camera smoothing
+            centerX = int(centerX * .97 + targetX * .03)
+            centerY = int(centerY * .97 + targetY * .03)
+            largestDim = int(largestDim * .97 + targetDim * .03)
+
+            startY = centerY - largestDim / 2
+            endY = centerY + largestDim / 2
+            startX = centerX - largestDim / 2
+            endX = centerX + largestDim / 2
+
+            # Keep camera within frame boundries
+            if startY <= 0 or endY >= maxHeight:
+                if startY <= 0:
+                    endY += (0 - startY)
+                    startY = 0
+                else:
+                    startY -= (endY - maxHeight)
+                    endY = maxHeight
+            if startX <= 0 or endX >= maxWidth:
+                if startX <= 0:
+                    endX += (0 - startX)
+                    startX = 0
+                else:
+                    startX -= (endX - maxWidth)
+                    endX = maxWidth
+            currentCrop = [int(startY), int(endY), int(startX), int(endX)]
+
             # Stream results
             im0 = annotator.result()
+            imgTest = imgTest[currentCrop[0]: currentCrop[1], currentCrop[2]: currentCrop[3]]
+            resizedImgTest = cv2.resize(imgTest, (500, 500), interpolation=cv2.INTER_AREA)
             if show_vid:
-                cv2.imshow(str(p), im0)
+                # cv2.imshow(str(p), im0)
+                cv2.imshow("Catcam", resizedImgTest)
                 cv2.waitKey(1)  # 1 millisecond
 
             # Save results (image with detections)
@@ -234,10 +308,10 @@ def detect(opt):
                         vid_writer[i].release()  # release previous video writer
                     if vid_cap:  # video
                         fps = vid_cap.get(cv2.CAP_PROP_FPS)
-                        w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                        w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH)) # 500
                         h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                     else:  # stream
-                        fps, w, h = 30, im0.shape[1], im0.shape[0]
+                        fps, w, h = 30, resizedImgTest.shape[1], resizedImgTest.shape[0]
                     save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
                     vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
                 vid_writer[i].write(im0)
