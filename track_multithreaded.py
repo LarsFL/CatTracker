@@ -29,7 +29,7 @@ from yolov5.utils.plots import Annotator, colors, save_one_box
 from deep_sort.utils.parser import get_config
 from deep_sort.deep_sort import DeepSort
 
-targetX, targetY, targetDim = 1000, 500, 300
+targetX, targetY, targetDim = 200, 200, 50
 threadActive = False
 lostTargetCount = 0
 threads = [threading._DummyThread]
@@ -40,13 +40,12 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
-def AIThread(seen, path, im0s, save_dir, source, save_crop, names, outputs, deepsort_list, dt, t2, s, im, model, opt):
+def AIThread(seen, path, im0s, save_dir, source, save_crop, names, outputs, deepsort_list, dt, t2, s, im, model, opt, webcam):
         # Inference
     visualize = increment_path(save_dir / Path(path[0]).stem, mkdir=True) if opt.visualize else False
     pred = model(im, augment=opt.augment, visualize=visualize)
     t3 = time_sync()
     dt[1] += t3 - t2
-
     # Apply NMS
     pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres, opt.classes, opt.agnostic_nms, max_det=opt.max_det)
     dt[2] += time_sync() - t3
@@ -55,8 +54,23 @@ def AIThread(seen, path, im0s, save_dir, source, save_crop, names, outputs, deep
     # Process detections
     for i, det in enumerate(pred):  # detections per image
         seen += 1
-        p, im0 = path, im0s.copy()
-        p = Path(p)  # to Path
+        if webcam:  # nr_sources >= 1
+            p, im0, _ = path[i], im0s[i].copy(), dataset.count
+            p = Path(p)  # to Path
+            s += f'{i}: '
+            txt_file_name = p.name
+            save_path = str(save_dir / p.name)  # im.jpg, vid.mp4, ...
+        else:
+            p, im0, _ = path, im0s.copy(), getattr(dataset, 'frame', 0)
+            p = Path(p)  # to Path
+            # video file
+            if source.endswith(VID_FORMATS):
+                txt_file_name = p.stem
+                save_path = str(save_dir / p.name)  # im.jpg, vid.mp4, ...
+            # folder with imgs
+            else:
+                txt_file_name = p.parent.name  # get folder name containing current img
+                save_path = str(save_dir / p.parent.name)  # im.jpg, vid.mp4, ...
         # video file
         if source.endswith(VID_FORMATS):
             txt_file_name = p.stem
@@ -285,18 +299,36 @@ if __name__ == '__main__':
             dt[0] += t2 - t1
 
 
-            imgTest = im0s.copy()
-            maxWidth = imgTest.shape[1]
-            maxHeight = imgTest.shape[0]
             ## FUNCTION STUFF
             if firstDing or not threads[0].is_alive():
                 firstDing = False
                 print(type(dataset))
-                thread = multiprocessing.Process(target=AIThread, args=(seen, path, im0s, save_dir, source, save_crop, names, outputs, deepsort_list, dt, t2, s, im, model, opt))
+                thread = multiprocessing.Process(target=AIThread, args=(seen, path, im0s, save_dir, source, save_crop, names, outputs, deepsort_list, dt, t2, s, im, model, opt, webcam))
                 threads[0] = thread
                 print("Starting")
                 threads[0].start()
+            
+            if webcam:  # nr_sources >= 1
+                p, im0, _ = path[i], im0s[i].copy(), dataset.count
+                p = Path(p)  # to Path
+                s += f'{i}: '
+                txt_file_name = p.name
+                save_path = str(save_dir / p.name)  # im.jpg, vid.mp4, ...
+            else:
+                p, im0, _ = path, im0s.copy(), getattr(dataset, 'frame', 0)
+                p = Path(p)  # to Path
+                # video file
+                if source.endswith(VID_FORMATS):
+                    txt_file_name = p.stem
+                    save_path = str(save_dir / p.name)  # im.jpg, vid.mp4, ...
+                # folder with imgs
+                else:
+                    txt_file_name = p.parent.name  # get folder name containing current img
+                    save_path = str(save_dir / p.parent.name)  # im.jpg, vid.mp4, ...
 
+            imgTest = im0.copy()
+            maxWidth = imgTest.shape[1]
+            maxHeight = imgTest.shape[0]
             print("Loop")
             # Apply camera smoothing
             centerX = int(centerX * .97 + targetX * .03)
