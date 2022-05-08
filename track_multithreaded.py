@@ -1,6 +1,7 @@
 # limit the number of cpus used by high performance libraries
 import os
 import time
+from xmlrpc.server import MultiPathXMLRPCServer
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -19,6 +20,7 @@ import torch
 import torch.backends.cudnn as cudnn
 import threading
 import multiprocessing
+import pickle
 
 from yolov5.models.common import DetectMultiBackend
 from yolov5.utils.datasets import LoadImages, LoadStreams, VID_FORMATS
@@ -26,12 +28,12 @@ from yolov5.utils.general import (LOGGER, check_img_size, non_max_suppression, s
                                   check_imshow, xyxy2xywh, increment_path, strip_optimizer, colorstr)
 from yolov5.utils.torch_utils import select_device, time_sync
 from yolov5.utils.plots import Annotator, colors, save_one_box
-from deep_sort.utils.parser import get_config
-from deep_sort.deep_sort import DeepSort
 
-targetX, targetY, targetDim = 200, 200, 50
+targetX = multiprocessing.Value('i', 500)
+targetY = multiprocessing.Value('i', 500)
+targetDim= multiprocessing.Value('i', 50)
 threadActive = False
-lostTargetCount = 0
+lostTargetCount = multiprocessing.Value('i', 0)
 threads = [threading._DummyThread]
 
 FILE = Path(__file__).resolve()
@@ -40,28 +42,33 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
-def AIThread(seen, path, im0s, save_dir, source, save_crop, names, outputs, deepsort_list, dt, t2, s, im, model, opt, webcam):
+# model, im0s, deepsort_list, 
+def AIThread(seen, path, save_dir, source, save_crop, names, dt, t2, s, im, webcam, count, outputs, opt, frame, newTargetX, newTargetY, newTargetDim, lostTargetCount):
+    with open("pickled_vars.p", "rb") as f:
+        data_tuple = pickle.load(f, encoding='bytes')
+    model, im0s, deepsort_list = data_tuple
         # Inference
+    print(1)
     visualize = increment_path(save_dir / Path(path[0]).stem, mkdir=True) if opt.visualize else False
     pred = model(im, augment=opt.augment, visualize=visualize)
     t3 = time_sync()
     dt[1] += t3 - t2
     # Apply NMS
+    print(2)
     pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres, opt.classes, opt.agnostic_nms, max_det=opt.max_det)
     dt[2] += time_sync() - t3
-    print("Set to true")
-    global targetX, targetY, targetDim, threadActive, lostTargetCount
+    print(3)
     # Process detections
     for i, det in enumerate(pred):  # detections per image
         seen += 1
         if webcam:  # nr_sources >= 1
-            p, im0, _ = path[i], im0s[i].copy(), dataset.count
+            p, im0, _ = path[i], im0s[i].copy(), count
             p = Path(p)  # to Path
             s += f'{i}: '
             txt_file_name = p.name
             save_path = str(save_dir / p.name)  # im.jpg, vid.mp4, ...
         else:
-            p, im0, _ = path, im0s.copy(), getattr(dataset, 'frame', 0)
+            p, im0, _ = path, im0s.copy(), frame
             p = Path(p)  # to Path
             # video file
             if source.endswith(VID_FORMATS):
@@ -84,7 +91,7 @@ def AIThread(seen, path, im0s, save_dir, source, save_crop, names, outputs, deep
         s += '%gx%g ' % im.shape[2:]  # print string
         imc = im0.copy() if save_crop else im0  # for save_crop
 
-
+        print(4)
         annotator = Annotator(im0, line_width=2, pil=not ascii)
 
         if det is not None and len(det):
@@ -111,6 +118,8 @@ def AIThread(seen, path, im0s, save_dir, source, save_crop, names, outputs, deep
             firstTargetX, firstTargetY = 0, 0
             secondTargetX, secondTargetY = 0, 0
             firstTargetDim, secondTargetDim = 0, 0
+            print(5)
+            print(len(outputs) + len(outputs[i]))
             # draw boxes for visualization
             if len(outputs[i]) > 0:
                 for j, (output) in enumerate(outputs[i]):
@@ -139,22 +148,23 @@ def AIThread(seen, path, im0s, save_dir, source, save_crop, names, outputs, deep
                     if save_crop:
                         txt_file_name = txt_file_name if (isinstance(path, list) and len(path) > 1) else ''
                         save_one_box(bboxes, imc, file=save_dir / 'crops' / txt_file_name / names[c] / f'{id}' / f'{p.stem}.jpg', BGR=True)
-                
+                print(6)
                 if (secondTargetX == 0 and lostTargetCount == 0 and firstTargetX != 0):
-                    targetX = firstTargetX
-                    targetY = firstTargetY
-                    targetDim = firstTargetDim
+                    print("Changing value")
+                    newTargetX.value = firstTargetX
+                    newTargetY.value = firstTargetY
+                    newTargetDim.value = firstTargetDim
 
                 if (secondTargetX != 0):
                     if (abs(secondTargetX - firstTargetX) < (.3 * maxWidth) and abs(secondTargetY - firstTargetY) < (.3 * maxHeight)):
                         lostTargetCount = 100
-                        targetX = int((firstTargetX + secondTargetX) / 2)
-                        targetY = int((firstTargetY + secondTargetY) / 2)
-                        targetDim = int(max(firstTargetDim, secondTargetDim) * 1.85)
+                        newTargetX.value = int((firstTargetX + secondTargetX) / 2)
+                        newTargetY.value = int((firstTargetY + secondTargetY) / 2)
+                        newTargetDim.value = int(max(firstTargetDim, secondTargetDim) * 1.85)
                     else:
-                        targetX = firstTargetX
-                        targetY = firstTargetY
-                        targetDim = firstTargetDim
+                        newTargetX.value = firstTargetX
+                        newTargetY.value = firstTargetY
+                        newTargetDim.value = firstTargetDim
                         lostTargetCount = lostTargetCount - 1 if lostTargetCount != 0 else 0
                 
                 if (secondTargetX == 0 and lostTargetCount > 0):
@@ -166,37 +176,7 @@ def AIThread(seen, path, im0s, save_dir, source, save_crop, names, outputs, deep
             deepsort_list[i].increment_ages()
             LOGGER.info('No detections')
 
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--yolo_model', nargs='+', type=str, default='yolov5m.pt', help='model.pt path(s)')
-    parser.add_argument('--deep_sort_model', type=str, default='osnet_x0_25')
-    parser.add_argument('--source', type=str, default='0', help='source')  # file/folder, 0 for webcam
-    parser.add_argument('--output', type=str, default='inference/output', help='output folder')  # output folder
-    parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640], help='inference size h,w')
-    parser.add_argument('--conf-thres', type=float, default=0.5, help='object confidence threshold')
-    parser.add_argument('--iou-thres', type=float, default=0.5, help='IOU threshold for NMS')
-    parser.add_argument('--fourcc', type=str, default='mp4v', help='output video codec (verify ffmpeg support)')
-    parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
-    parser.add_argument('--show-vid', action='store_true', help='display tracking video results')
-    parser.add_argument('--save-vid', action='store_true', help='save video tracking results')
-    parser.add_argument('--save-txt', action='store_true', help='save MOT compliant results to *.txt')
-    # class 0 is person, 1 is bycicle, 2 is car... 79 is oven
-    parser.add_argument('--classes', nargs='+', type=int, help='filter by class: --class 0, or --class 16 17')
-    parser.add_argument('--agnostic-nms', action='store_true', help='class-agnostic NMS')
-    parser.add_argument('--augment', action='store_true', help='augmented inference')
-    parser.add_argument('--update', action='store_true', help='update all models')
-    parser.add_argument('--evaluate', action='store_true', help='augmented inference')
-    parser.add_argument("--config_deepsort", type=str, default="deep_sort/configs/deep_sort.yaml")
-    parser.add_argument("--half", action="store_true", help="use FP16 half-precision inference")
-    parser.add_argument('--visualize', action='store_true', help='visualize features')
-    parser.add_argument('--max-det', type=int, default=1000, help='maximum detection per image')
-    parser.add_argument('--save-crop', action='store_true', help='save cropped prediction boxes')
-    parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
-    parser.add_argument('--project', default=ROOT / 'runs/track', help='save results to project/name')
-    parser.add_argument('--name', default='exp', help='save results to project/name')
-    parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
-    opt = parser.parse_args()
+def run(opt):
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
 
     with torch.no_grad():
@@ -206,7 +186,9 @@ if __name__ == '__main__':
             opt.save_txt, opt.imgsz, opt.evaluate, opt.half, opt.project, opt.exist_ok, opt.update, opt.save_crop
         webcam = source == '0' or source.startswith(
             'rtsp') or source.startswith('http') or source.endswith('.txt')
-
+        print("Importing")
+        from deep_sort.utils.parser import get_config
+        from deep_sort.deep_sort import DeepSort
         # Initialize
         device = select_device(opt.device)
         half &= device.type != 'cpu'  # half precision only supported on CUDA
@@ -302,8 +284,10 @@ if __name__ == '__main__':
             ## FUNCTION STUFF
             if firstDing or not threads[0].is_alive():
                 firstDing = False
-                print(type(dataset))
-                thread = multiprocessing.Process(target=AIThread, args=(seen, path, im0s, save_dir, source, save_crop, names, outputs, deepsort_list, dt, t2, s, im, model, opt, webcam))
+                pickleFile = open("pickled_vars.p", "wb")
+                pickleFile.write(pickle.dumps((model, im0s, deepsort_list), -1))
+                pickleFile.close()
+                thread = multiprocessing.Process(target=AIThread, args=[seen, path, save_dir, source, save_crop, names, dt, t2, s, im, webcam, dataset.count, outputs, opt, getattr(dataset, 'frame', 0), targetX, targetY, targetDim, lostTargetCount])
                 threads[0] = thread
                 print("Starting")
                 threads[0].start()
@@ -329,11 +313,10 @@ if __name__ == '__main__':
             imgTest = im0.copy()
             maxWidth = imgTest.shape[1]
             maxHeight = imgTest.shape[0]
-            print("Loop")
             # Apply camera smoothing
-            centerX = int(centerX * .97 + targetX * .03)
-            centerY = int(centerY * .97 + targetY * .03)
-            largestDim = int(largestDim * .97 + targetDim * .03)
+            centerX = int(centerX * .97 + targetX.value * .03)
+            centerY = int(centerY * .97 + targetY.value * .03)
+            largestDim = int(largestDim * .97 + targetDim.value * .03)
 
             startY = centerY - largestDim / 2
             endY = centerY + largestDim / 2
@@ -391,3 +374,39 @@ if __name__ == '__main__':
             LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
         if update:
             strip_optimizer(yolo_model)  # update model (to fix SourceChangeWarning)
+
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--yolo_model', nargs='+', type=str, default='yolov5m.pt', help='model.pt path(s)')
+    parser.add_argument('--deep_sort_model', type=str, default='osnet_x0_25')
+    parser.add_argument('--source', type=str, default='0', help='source')  # file/folder, 0 for webcam
+    parser.add_argument('--output', type=str, default='inference/output', help='output folder')  # output folder
+    parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640], help='inference size h,w')
+    parser.add_argument('--conf-thres', type=float, default=0.5, help='object confidence threshold')
+    parser.add_argument('--iou-thres', type=float, default=0.5, help='IOU threshold for NMS')
+    parser.add_argument('--fourcc', type=str, default='mp4v', help='output video codec (verify ffmpeg support)')
+    parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    parser.add_argument('--show-vid', action='store_true', help='display tracking video results')
+    parser.add_argument('--save-vid', action='store_true', help='save video tracking results')
+    parser.add_argument('--save-txt', action='store_true', help='save MOT compliant results to *.txt')
+    # class 0 is person, 1 is bycicle, 2 is car... 79 is oven
+    parser.add_argument('--classes', nargs='+', type=int, help='filter by class: --class 0, or --class 16 17')
+    parser.add_argument('--agnostic-nms', action='store_true', help='class-agnostic NMS')
+    parser.add_argument('--augment', action='store_true', help='augmented inference')
+    parser.add_argument('--update', action='store_true', help='update all models')
+    parser.add_argument('--evaluate', action='store_true', help='augmented inference')
+    parser.add_argument("--config_deepsort", type=str, default="deep_sort/configs/deep_sort.yaml")
+    parser.add_argument("--half", action="store_true", help="use FP16 half-precision inference")
+    parser.add_argument('--visualize', action='store_true', help='visualize features')
+    parser.add_argument('--max-det', type=int, default=1000, help='maximum detection per image')
+    parser.add_argument('--save-crop', action='store_true', help='save cropped prediction boxes')
+    parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
+    parser.add_argument('--project', default=ROOT / 'runs/track', help='save results to project/name')
+    parser.add_argument('--name', default='exp', help='save results to project/name')
+    parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
+    opt = parser.parse_args()
+
+    run(opt)
+    
